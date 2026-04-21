@@ -1,0 +1,172 @@
+name: Install test (packaging)
+
+# End-to-end validation of the shipped .deb and .rpm packages for
+# couchdb-fractalsql.
+#
+# Unlike the other factories (where the artifact is a DB plugin), this
+# repo ships a standalone external-query-server binary. The test
+# installs the package, runs the installed /usr/bin/fractalsql-couch
+# through the heartbeat.sh JSON-over-stdio protocol suite, and
+# confirms edition/version + all three protocol cases pass.
+#
+# Runs on every push + PR (same cadence as CodeQL) so packaging bugs
+# surface before merge, not at tag time.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    - cron: '53 4 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------
+  # Stage 1: build .deb + .rpm from source once (amd64 only), share
+  # the artifacts with the install-test jobs below. arm64 is covered
+  # by release.yml's link-step assertions.
+  # ------------------------------------------------------------------
+  build-artifacts:
+    name: Build static binary + .deb + .rpm (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build static fractalsql-couch binary
+        run: |
+          chmod +x build.sh
+          ./build.sh amd64
+          ls -l dist/amd64/fractalsql-couch
+
+      - name: Install .deb packaging toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev debhelper
+
+      - name: Build .deb
+        run: |
+          chmod +x scripts/build_deb.sh
+          scripts/build_deb.sh amd64
+          ls -l dist/amd64/*.deb
+
+      - name: Build .rpm (via rockylinux:9 container)
+        run: |
+          chmod +x scripts/build_rpm.sh
+          scripts/build_rpm.sh amd64
+          ls -l dist/amd64/*.rpm
+
+      - name: Upload built packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-amd64
+          path: |
+            dist/amd64/*.deb
+            dist/amd64/*.rpm
+            dist/amd64/fractalsql-couch
+          retention-days: 1
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Stage 2a: Debian/Ubuntu install test.
+  # Install the .deb inside ubuntu:24.04, then run the heartbeat suite
+  # against /usr/bin/fractalsql-couch — the same suite that gates the
+  # local-build smoke test, now exercising the installed package.
+  # ------------------------------------------------------------------
+  debian-install:
+    name: Debian — install .deb + heartbeat protocol suite
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for tests/heartbeat.sh)
+        uses: actions/checkout@v4
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages-amd64
+          path: dist/amd64
+
+      - name: Install + verify in ubuntu:24.04
+        run: |
+          cat > test-deb.sh <<'SCRIPT'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -qq -y python3  # heartbeat.sh shells out to python3 for JSON escaping
+          apt-get install -qq -y ./dist/amd64/fractalsql-couch_*_amd64.deb
+
+          # Binary must land on PATH at the declared install location.
+          test -x /usr/bin/fractalsql-couch \
+              || { echo "FAIL: /usr/bin/fractalsql-couch missing or not executable"; exit 1; }
+
+          echo "--- basic invocation check ---"
+          # An empty stdin to the query server should produce no output
+          # and exit 0 — the protocol loop just drains.
+          : | /usr/bin/fractalsql-couch >/dev/null
+
+          # Run the heartbeat suite against the INSTALLED binary.
+          # heartbeat.sh looks for ../fractalsql-couch by default; we
+          # override with the installed path via a symlink in the
+          # repo root, which the script's relative lookup will find.
+          cd /work
+          ln -sf /usr/bin/fractalsql-couch ./fractalsql-couch
+          bash tests/heartbeat.sh
+          SCRIPT
+          chmod +x test-deb.sh
+          docker run --rm \
+              -v "${{ github.workspace }}:/work" \
+              -w /work \
+              ubuntu:24.04 \
+              bash /work/test-deb.sh
+
+  # ------------------------------------------------------------------
+  # Stage 2b: RHEL install test (Rocky Linux 9).
+  # Install the .rpm, run the same heartbeat suite — catches any drift
+  # between Debian packaging (dpkg-buildpackage) and RPM packaging
+  # (rpmbuild) that would break on RHEL.
+  # ------------------------------------------------------------------
+  rpm-install:
+    name: RHEL (Rocky 9) — install .rpm + heartbeat protocol suite
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for tests/heartbeat.sh)
+        uses: actions/checkout@v4
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages-amd64
+          path: dist/amd64
+
+      - name: Install + verify in rockylinux:9
+        run: |
+          cat > test-rpm.sh <<'SCRIPT'
+          set -euo pipefail
+          dnf install -qy python3 bash
+          dnf install -qy ./dist/amd64/fractalsql-couch-*.x86_64.rpm
+
+          test -x /usr/bin/fractalsql-couch \
+              || { echo "FAIL: /usr/bin/fractalsql-couch missing or not executable"; exit 1; }
+
+          echo "--- basic invocation check ---"
+          : | /usr/bin/fractalsql-couch >/dev/null
+
+          cd /work
+          ln -sf /usr/bin/fractalsql-couch ./fractalsql-couch
+          bash tests/heartbeat.sh
+          SCRIPT
+          chmod +x test-rpm.sh
+          docker run --rm \
+              -v "${{ github.workspace }}:/work" \
+              -w /work \
+              rockylinux:9 \
+              bash /work/test-rpm.sh

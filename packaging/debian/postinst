@@ -1,0 +1,36 @@
+#!/bin/sh
+# debian/postinst — fractalsql-couch.
+#
+# The binary is installed at /usr/bin/fractalsql-couch. We do NOT edit
+# CouchDB's local.ini on the admin's behalf — query_servers is a
+# sensitive config section and the admin should opt in explicitly.
+# Instead, print the snippet they need to add.
+
+set -e
+
+case "$1" in
+    configure)
+        cat <<'EOF'
+
+fractalsql-couch installed at /usr/bin/fractalsql-couch.
+
+To register it with CouchDB, add the following to your local.ini
+(typically /opt/couchdb/etc/local.ini or /etc/couchdb/local.ini)
+under the [query_servers] section, then restart CouchDB:
+
+    [query_servers]
+    fractalsql = /usr/bin/fractalsql-couch
+
+Design documents can then set "language": "fractalsql" to use
+FractalSQL map functions. See
+/usr/share/doc/fractalsql-couch/README_COUCH.txt for details.
+
+EOF
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

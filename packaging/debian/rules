@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+#
+# debian/rules for fractalsql-couch.
+#
+# We don't build from source inside dpkg-buildpackage — the static
+# binary is pre-produced by ../build.sh (docker buildx) and staged at
+# dist/${DEB_HOST_ARCH}/fractalsql-couch before debuild is invoked.
+# scripts/build_deb.sh orchestrates that staging and the copy of this
+# packaging/debian/ tree into ./debian for dpkg-buildpackage.
+
+export DH_VERBOSE = 1
+export DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	@echo "=== override_dh_auto_clean: skipping (binary pre-staged in dist/) ==="
+
+override_dh_auto_configure:
+	@echo "=== override_dh_auto_configure: skipping (no autotools/CMake) ==="
+
+override_dh_auto_test:
+	@echo "=== override_dh_auto_test: skipping (heartbeat runs in the workflow already) ==="
+
+override_dh_auto_build:
+	# No build step — the binary is staged in dist/ by build.sh.
+	@test -f dist/$(DEB_HOST_ARCH)/fractalsql-couch \
+	    || { echo "ERROR: dist/$(DEB_HOST_ARCH)/fractalsql-couch missing. Run './build.sh $(DEB_HOST_ARCH)' first."; exit 1; }
+
+override_dh_auto_install:
+	install -d debian/fractalsql-couch/usr/bin
+	install -m 0755 dist/$(DEB_HOST_ARCH)/fractalsql-couch \
+	    debian/fractalsql-couch/usr/bin/fractalsql-couch
+
+override_dh_strip:
+	# Already stripped at link time (-Wl,--strip-all).
+	:

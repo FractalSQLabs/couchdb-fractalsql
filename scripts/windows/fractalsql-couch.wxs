@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  scripts/windows/fractalsql-couch.wxs — WiX Toolset source for the
+  FractalSQL for CouchDB Windows MSI.
+
+  Shape
+    Standalone executable install, modelled on sqlite-fractalsql's
+    MSI minus the PATH checkbox. Apache CouchDB references the
+    bridge by absolute path from local.ini, so adding the install
+    dir to %PATH% has no value — admins paste the fully-qualified
+    path into their [query_servers] section.
+
+  UX flow
+    1. Welcome / EULA.
+    2. WixUI_InstallDir lets the user pick the install folder
+       (default: C:\Program Files\FractalSQL\CouchDB-Bridge).
+    3. Install copies fractalsql-couch.exe + README_COUCH.txt +
+       LICENSE + THIRD-PARTY-NOTICES.
+
+  Build
+    candle -arch x64   scripts\windows\fractalsql-couch.wxs -out obj\...
+    light  -ext WixUIExtension -ext WixUtilExtension ...
+
+  ProductId is auto-generated per release ("*") to force clean major
+  upgrades; UpgradeCode is the PERMANENT identity of the product line
+  — never change it across versions.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <Product Id="*"
+           Name="FractalSQL for CouchDB"
+           Language="1033"
+           Version="1.0.0"
+           Manufacturer="FractalSQLabs"
+           UpgradeCode="7A2D4E9B-8F1C-4E37-B0A6-3D9E1F52B041">
+
+    <!-- Platform inherits candle's -arch flag via sys.BUILDARCH.
+         Only x64 ships today: Apache CouchDB publishes no arm64 or
+         x86 Windows binaries, so there is no host server for a bridge
+         at those architectures. The sys.BUILDARCH plumbing is kept
+         here so re-adding arm64 later is a matrix-only change. -->
+    <Package InstallerVersion="300"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="$(sys.BUILDARCH)"
+             Description="FractalSQL external query server for Apache CouchDB"
+             Manufacturer="FractalSQLabs" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of FractalSQL for CouchDB is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <!-- x86 is not shipped — Apache CouchDB has no 32-bit Windows
+         binaries, so there is no host for a 32-bit bridge. The guard
+         keeps the conditional symmetric with the foundry siblings. -->
+    <?if $(sys.BUILDARCH) = "x86" ?>
+        <?define ProgramFilesDir = "ProgramFilesFolder" ?>
+    <?else ?>
+        <?define ProgramFilesDir = "ProgramFiles64Folder" ?>
+    <?endif ?>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="$(var.ProgramFilesDir)">
+        <Directory Id="FractalSQLFolder" Name="FractalSQL">
+          <Directory Id="INSTALLFOLDER" Name="CouchDB-Bridge" />
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <ComponentGroup Id="CoreFiles" Directory="INSTALLFOLDER">
+
+      <Component Id="c_FractalsqlCouchExe"
+                 Guid="DE3F7B51-9A64-4C8D-9E4F-27C1B5A6F312">
+        <File Id="fractalsql_couch.exe"
+              Name="fractalsql-couch.exe"
+              Source="dist/windows/fractalsql-couch.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_ReadmeCouch"
+                 Guid="B42A1F6E-3D07-4E5A-A8F1-1C6D20B3A9F4">
+        <File Id="README_COUCH.txt"
+              Source="packaging/README_COUCH.txt"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_License"
+                 Guid="0D4F9B8C-3A02-4B5F-B7AE-62A8D7F55810">
+        <File Id="LICENSE.txt"
+              Source="LICENSE"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_ThirdPartyNotices"
+                 Guid="9B4E6A7F-1C2D-4E8F-9A1B-3C5D7E9F0A2B">
+        <File Id="THIRD_PARTY_NOTICES.md"
+              Name="THIRD-PARTY-NOTICES.md"
+              Source="THIRD-PARTY-NOTICES.md"
+              KeyPath="yes" />
+      </Component>
+
+    </ComponentGroup>
+
+    <Feature Id="MainFeature"
+             Title="FractalSQL for CouchDB"
+             Level="1"
+             Display="expand"
+             AllowAdvertise="no">
+      <ComponentGroupRef Id="CoreFiles" />
+    </Feature>
+
+    <!-- UI: standard WixUI_InstallDir (Welcome → EULA → FolderDlg →
+         Ready → Progress). Folder picker defaults to
+         C:\Program Files\FractalSQL\CouchDB-Bridge. -->
+    <UIRef Id="WixUI_InstallDir" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+
+  </Product>
+</Wix>

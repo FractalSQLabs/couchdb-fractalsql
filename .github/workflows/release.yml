@@ -1,0 +1,534 @@
+name: Release couchdb-fractalsql Packages
+
+# Tag-triggered: pushing vX.Y.Z builds all platform artifacts, smoke-
+# tests where feasible, produces a source tarball + SHA256SUMS, and
+# uploads everything to the GitHub Release.
+#
+# workflow_dispatch is enabled for dry runs that validate the matrix
+# without publishing — Upload-to-Release steps are gated on the ref
+# being a tag.
+#
+# Coverage:
+#   linux_amd64 / linux_arm64 — static binary, .deb, .rpm, .zip
+#   osx_amd64 / osx_arm64     — static binary, .zip
+#                               (both produced on macos-14; amd64 via
+#                               clang -arch x86_64 cross-compile)
+#   osx_universal             — lipo'd universal binary, .pkg, .zip
+#   windows_amd64 — fractalsql-couch.exe, .msi, .zip
+#     (x64 only; Apache CouchDB itself ships no arm64/x86 Windows
+#     binaries, so there is no host server for a 32-bit or arm64
+#     bridge.)
+#
+# Signing gates (all secrets OPTIONAL; absent = unsigned artifact):
+#   GPG_PRIVATE_KEY / GPG_PASSPHRASE                     — detached .asc
+#   WINDOWS_CERT_PFX_BASE64 / WINDOWS_CERT_PASSWORD      — Authenticode
+#   APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64,
+#   APPLE_DEVELOPER_ID_INSTALLER_CERT_BASE64,
+#   APPLE_CERT_PASSWORD, APPLE_ID, APPLE_TEAM_ID,
+#   APPLE_APP_PASSWORD                                   — codesign + notarize
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ==================================================================
+  # Linux: static binary + .deb + .rpm + packaged .zip
+  # ==================================================================
+  build:
+    name: build ${{ matrix.platform_tag }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform_tag: linux_amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform_tag: linux_arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Packaging Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential dpkg-dev debhelper fakeroot zip
+
+      - name: Build fractalsql-couch for ${{ matrix.arch }}
+        env:
+          BUILDX_CACHE_ARGS: >-
+            --cache-from=type=gha,scope=couchdb-fractalsql-${{ matrix.arch }}
+            --cache-to=type=gha,scope=couchdb-fractalsql-${{ matrix.arch }},mode=max
+        run: |
+          chmod +x build.sh
+          ./build.sh ${{ matrix.arch }}
+          ls -l dist/${{ matrix.arch }}/fractalsql-couch
+
+      - name: Smoke test (protocol loop + emit batching)
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          cp -f dist/${{ matrix.arch }}/fractalsql-couch fractalsql-couch
+          chmod +x tests/heartbeat.sh
+          ./tests/heartbeat.sh
+
+      - name: Build .deb and .rpm for ${{ matrix.arch }}
+        run: |
+          chmod +x scripts/build_deb.sh scripts/build_rpm.sh
+          scripts/build_deb.sh ${{ matrix.arch }}
+          scripts/build_rpm.sh ${{ matrix.arch }}
+
+      - name: Package .zip
+        run: |
+          set -euo pipefail
+          DIST_DIR="dist/packages"
+          mkdir -p "${DIST_DIR}"
+          ZIP_NAME="couchdb-fractalsql-${{ matrix.platform_tag }}.zip"
+          STAGE="$(mktemp -d)"
+          cp dist/${{ matrix.arch }}/fractalsql-couch "${STAGE}/fractalsql-couch"
+          cp LICENSE                     "${STAGE}/LICENSE"
+          cp THIRD-PARTY-NOTICES.md      "${STAGE}/THIRD-PARTY-NOTICES.md"
+          cp packaging/README_COUCH.txt  "${STAGE}/README_COUCH.txt"
+          ( cd "${STAGE}" && zip -9 -r "${OLDPWD}/${DIST_DIR}/${ZIP_NAME}" . > /dev/null )
+          rm -rf "${STAGE}"
+          ls -l "${DIST_DIR}/${ZIP_NAME}"
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: couchdb-fractalsql-${{ matrix.platform_tag }}
+          path: |
+            dist/packages/couchdb-fractalsql-${{ matrix.arch }}.deb
+            dist/packages/couchdb-fractalsql-${{ matrix.arch }}.rpm
+            dist/packages/couchdb-fractalsql-${{ matrix.platform_tag }}.zip
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/packages/couchdb-fractalsql-${{ matrix.arch }}.deb
+            dist/packages/couchdb-fractalsql-${{ matrix.arch }}.rpm
+            dist/packages/couchdb-fractalsql-${{ matrix.platform_tag }}.zip
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================================================================
+  # Windows: fractalsql-couch.exe + .msi + packaged .zip
+  # ==================================================================
+  build-windows-msi:
+    name: windows ${{ matrix.platform_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            platform_tag: windows_amd64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install -y --no-progress wixtoolset
+
+          # windows-latest usually wires candle.exe into PATH via
+          # the chocolatey shim, but occasionally it doesn't land on
+          # a fresh image. Probe the standard install dirs and append
+          # explicitly if needed.
+          $wixBin = $null
+          $candidates = @(
+            "C:\Program Files (x86)\WiX Toolset v3.14\bin",
+            "C:\Program Files (x86)\WiX Toolset v3.11\bin",
+            "C:\Program Files\WiX Toolset v3.14\bin"
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "candle.exe")) { $wixBin = $c; break }
+          }
+          if (-not $wixBin) {
+            $hit = Get-ChildItem -Recurse -ErrorAction SilentlyContinue `
+                -Filter "candle.exe" -Path "C:\Program Files*" `
+                | Select-Object -First 1
+            if ($hit) { $wixBin = $hit.DirectoryName }
+          }
+          if (-not $wixBin) {
+            Write-Host "FATAL: candle.exe not found after choco install wixtoolset"
+            exit 1
+          }
+          Write-Host "WiX bin dir: $wixBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Build LuaJIT static
+        shell: cmd
+        run: |
+          git clone --depth=1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git C:\deps\LuaJIT || exit /b 1
+          cd /D C:\deps\LuaJIT\src || exit /b 1
+          call msvcbuild.bat static || exit /b 1
+          dir lua51.lib
+
+      - name: Fetch cJSON source
+        shell: cmd
+        run: |
+          git clone --depth=1 --branch v1.7.18 https://github.com/DaveGamble/cJSON.git C:\deps\cJSON || exit /b 1
+
+      - name: Build fractalsql-couch.exe for ${{ matrix.arch }}
+        shell: cmd
+        env:
+          LUAJIT_DIR: C:\deps\LuaJIT\src
+          CJSON_DIR:  C:\deps\cJSON
+          MSI_ARCH:   ${{ matrix.arch }}
+        run: |
+          call scripts\windows\build.bat
+
+      - name: Build MSI
+        shell: cmd
+        env:
+          MSI_ARCH: ${{ matrix.arch }}
+        run: |
+          call scripts\windows\build-msi.bat
+
+      - name: Authenticode sign MSI
+        if: ${{ env.WINDOWS_CERT_PFX_BASE64 != '' }}
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD:   ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath,
+              [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $msi = Get-ChildItem dist\windows\*.msi | Select-Object -First 1
+          & signtool sign /fd SHA256 /td SHA256 `
+              /tr "http://timestamp.digicert.com" `
+              /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD `
+              $msi.FullName
+          Remove-Item $pfxPath
+
+      - name: Package .zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $DIST_DIR = "dist/packages"
+          New-Item -ItemType Directory -Force -Path $DIST_DIR | Out-Null
+          $ZIP_NAME = "couchdb-fractalsql-${{ matrix.platform_tag }}.zip"
+          $STAGE = New-Item -ItemType Directory `
+              -Path ([System.IO.Path]::GetTempFileName() + ".d")
+          Copy-Item "dist/windows_${{ matrix.arch }}/fractalsql-couch.exe" `
+              "$STAGE/fractalsql-couch.exe"
+          Copy-Item LICENSE                     "$STAGE/LICENSE"
+          Copy-Item THIRD-PARTY-NOTICES.md      "$STAGE/THIRD-PARTY-NOTICES.md"
+          Copy-Item packaging/README_COUCH.txt  "$STAGE/README_COUCH.txt"
+          Compress-Archive -Path "$STAGE/*" `
+              -DestinationPath "$DIST_DIR/$ZIP_NAME" -Force
+          Remove-Item -Recurse -Force $STAGE
+          Get-ChildItem "$DIST_DIR"
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: couchdb-fractalsql-${{ matrix.platform_tag }}
+          path: |
+            dist/windows/*.msi
+            dist/packages/couchdb-fractalsql-${{ matrix.platform_tag }}.zip
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/windows/*.msi
+            dist/packages/couchdb-fractalsql-${{ matrix.platform_tag }}.zip
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================================================================
+  # macOS per-arch: both arches on macos-14 (Apple Silicon).
+  #
+  # The Intel slice is produced via clang's -arch x86_64 cross-compile
+  # plus LuaJIT's HOST_CC / TARGET_FLAGS build split. We no longer
+  # request macos-13: GitHub's Intel runner pool has become severely
+  # capacity-constrained since the default shifted to Apple Silicon,
+  # and jobs routinely queue for tens of minutes before a runner
+  # becomes available. macos-14 has abundant capacity and Apple's
+  # clang toolchain emits both architectures from either host.
+  # ==================================================================
+  build-macos:
+    name: macos ${{ matrix.platform_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform_tag: osx_amd64
+          - arch: arm64
+            platform_tag: osx_arm64
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build fractalsql-couch for ${{ matrix.arch }}
+        run: |
+          chmod +x scripts/macos/build.sh
+          scripts/macos/build.sh ${{ matrix.arch }}
+
+      # Only the native (arm64) slice can execute on this runner. The
+      # x86_64 slice is validated via its Mach-O header (arch + load
+      # commands), the absence of disallowed dylib deps from otool,
+      # and the heartbeat that already ran against the Linux amd64
+      # binary which exercises the same protocol C.
+      - name: Smoke test (protocol loop + emit batching)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -euo pipefail
+          cp -f dist/osx_${{ matrix.arch }}/fractalsql-couch fractalsql-couch
+          chmod +x tests/heartbeat.sh
+          ./tests/heartbeat.sh
+
+      - name: Package .zip
+        run: |
+          set -euo pipefail
+          DIST_DIR="dist/packages"
+          mkdir -p "${DIST_DIR}"
+          ZIP_NAME="couchdb-fractalsql-${{ matrix.platform_tag }}.zip"
+          STAGE="$(mktemp -d)"
+          cp dist/osx_${{ matrix.arch }}/fractalsql-couch "${STAGE}/fractalsql-couch"
+          cp LICENSE                     "${STAGE}/LICENSE"
+          cp THIRD-PARTY-NOTICES.md      "${STAGE}/THIRD-PARTY-NOTICES.md"
+          cp packaging/README_COUCH.txt  "${STAGE}/README_COUCH.txt"
+          ( cd "${STAGE}" && zip -9 -r "${OLDPWD}/${DIST_DIR}/${ZIP_NAME}" . > /dev/null )
+          rm -rf "${STAGE}"
+          ls -l "${DIST_DIR}/${ZIP_NAME}"
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: couchdb-fractalsql-${{ matrix.platform_tag }}
+          path: |
+            dist/osx_${{ matrix.arch }}/fractalsql-couch
+            dist/packages/couchdb-fractalsql-${{ matrix.platform_tag }}.zip
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/packages/couchdb-fractalsql-${{ matrix.platform_tag }}.zip
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================================================================
+  # macOS universal: lipo both slices + pkgbuild + productbuild + .zip
+  # ==================================================================
+  build-macos-universal:
+    name: macos osx_universal
+    needs: build-macos
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Intel slice
+        uses: actions/download-artifact@v4
+        with:
+          name: couchdb-fractalsql-osx_amd64
+          path: _artifacts/osx_amd64
+
+      - name: Download Apple Silicon slice
+        uses: actions/download-artifact@v4
+        with:
+          name: couchdb-fractalsql-osx_arm64
+          path: _artifacts/osx_arm64
+
+      - name: Restage slices
+        run: |
+          set -euo pipefail
+          mkdir -p dist/osx_amd64 dist/osx_arm64
+          # upload-artifact@v4 preserves the full relative path from
+          # github.workspace, so the binary is nested under
+          # _artifacts/osx_<arch>/dist/osx_<arch>/fractalsql-couch —
+          # `find` lets us pick it up without hardcoding that depth.
+          AMD64_BIN=$(find _artifacts/osx_amd64 -type f -name fractalsql-couch | head -1)
+          ARM64_BIN=$(find _artifacts/osx_arm64 -type f -name fractalsql-couch | head -1)
+          test -n "${AMD64_BIN}" && test -n "${ARM64_BIN}"
+          cp "${AMD64_BIN}" dist/osx_amd64/fractalsql-couch
+          cp "${ARM64_BIN}" dist/osx_arm64/fractalsql-couch
+          chmod +x dist/osx_amd64/fractalsql-couch dist/osx_arm64/fractalsql-couch
+          ls -l dist/osx_amd64/ dist/osx_arm64/
+
+      - name: Import Apple signing certs
+        if: ${{ env.APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 != '' }}
+        env:
+          APP_CERT_B64:       ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERT_BASE64 }}
+          INSTALLER_CERT_B64: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_CERT_BASE64 }}
+          CERT_PASSWORD:      ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="${RUNNER_TEMP}/build.keychain"
+          KPASS="$(openssl rand -base64 24)"
+          security create-keychain -p "${KPASS}" "${KEYCHAIN}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN}"
+          security unlock-keychain -p "${KPASS}" "${KEYCHAIN}"
+          security list-keychains -d user -s "${KEYCHAIN}" $(security list-keychains -d user | tr -d '"')
+
+          echo "${APP_CERT_B64}"       | base64 -d > /tmp/app.p12
+          echo "${INSTALLER_CERT_B64}" | base64 -d > /tmp/installer.p12
+          security import /tmp/app.p12       -k "${KEYCHAIN}" -P "${CERT_PASSWORD}" -T /usr/bin/codesign
+          security import /tmp/installer.p12 -k "${KEYCHAIN}" -P "${CERT_PASSWORD}" -T /usr/bin/productbuild -T /usr/bin/pkgbuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KPASS}" "${KEYCHAIN}"
+          rm -f /tmp/app.p12 /tmp/installer.p12
+
+          APP_ID=$(security find-identity -v -p codesigning "${KEYCHAIN}" \
+                   | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          INST_ID=$(security find-identity -v "${KEYCHAIN}" \
+                    | awk -F'"' '/Developer ID Installer/ {print $2; exit}')
+          echo "APPLE_DEVELOPER_ID_APPLICATION=${APP_ID}"  >> "$GITHUB_ENV"
+          echo "APPLE_DEVELOPER_ID_INSTALLER=${INST_ID}"   >> "$GITHUB_ENV"
+
+      - name: Store notarytool credentials
+        if: ${{ env.APPLE_ID != '' }}
+        env:
+          APPLE_ID:           ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID:      ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials "notary-profile" \
+            --apple-id "${APPLE_ID}" \
+            --team-id  "${APPLE_TEAM_ID}" \
+            --password "${APPLE_APP_PASSWORD}"
+          echo "APPLE_KEYCHAIN_PROFILE=notary-profile" >> "$GITHUB_ENV"
+
+      - name: Build universal .pkg
+        run: |
+          chmod +x scripts/macos/build-pkg.sh
+          scripts/macos/build-pkg.sh
+
+      - name: Package .zip
+        run: |
+          set -euo pipefail
+          DIST_DIR="dist/packages"
+          mkdir -p "${DIST_DIR}"
+          ZIP_NAME="couchdb-fractalsql-osx_universal.zip"
+          STAGE="$(mktemp -d)"
+          cp dist/osx_universal/fractalsql-couch "${STAGE}/fractalsql-couch"
+          cp LICENSE                     "${STAGE}/LICENSE"
+          cp THIRD-PARTY-NOTICES.md      "${STAGE}/THIRD-PARTY-NOTICES.md"
+          cp packaging/README_COUCH.txt  "${STAGE}/README_COUCH.txt"
+          ( cd "${STAGE}" && zip -9 -r "${OLDPWD}/${DIST_DIR}/${ZIP_NAME}" . > /dev/null )
+          rm -rf "${STAGE}"
+          ls -l "${DIST_DIR}/${ZIP_NAME}"
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: couchdb-fractalsql-osx_universal
+          path: |
+            dist/osx_universal/*.pkg
+            dist/packages/couchdb-fractalsql-osx_universal.zip
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/osx_universal/*.pkg
+            dist/packages/couchdb-fractalsql-osx_universal.zip
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================================================================
+  # Aggregate: source tarball + SHA256SUMS across all artifacts
+  # ==================================================================
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, build-windows-msi, build-macos, build-macos-universal]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: _artifacts
+
+      - name: Restage into dist/
+        run: |
+          set -euo pipefail
+          mkdir -p dist/packages
+          find _artifacts -type f \
+              \( -name '*.deb' -o -name '*.rpm' -o -name '*.msi' \
+                 -o -name '*.pkg' -o -name '*.zip' \) \
+              -exec cp -v {} dist/packages/ \;
+          ls -l dist/packages
+
+      - name: Source tarball + SHA256SUMS
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh
+
+      - name: GPG sign artifacts
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+          find dist -type f \
+              \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \
+                 -o -name '*.msi' -o -name '*.pkg' -o -name '*.zip' \
+                 -o -name 'SHA256SUMS' \) \
+              -print0 \
+            | while IFS= read -r -d '' f; do
+                gpg --batch --yes --passphrase "${GPG_PASSPHRASE}" \
+                    --pinentry-mode loopback \
+                    --detach-sign --armor "${f}"
+              done
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/couchdb-fractalsql-*-src.tar.gz
+            dist/SHA256SUMS
+            dist/**/*.asc
+            dist/*.asc
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
